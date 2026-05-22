@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-simple-timestamp",
+	"name": "Simple Timestamp",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Automatically writes the current date/time to a frontmatter property every time a note is created or saved.",
+	"author": "Keven B.",
+	"authorUrl": "",
+	"fundingUrl": "",
+	"isDesktopOnly": false
+}
