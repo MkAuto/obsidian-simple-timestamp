@@ -1,4 +1,4 @@
-import {App, Notice, PluginSettingTab, Setting, moment} from "obsidian";
+import {AbstractInputSuggest, App, Notice, PluginSettingTab, Setting, TFolder, moment} from "obsidian";
 import SimpleTimestampPlugin from "./main";
 
 export interface SimpleTimestampSettings {
@@ -6,6 +6,7 @@ export interface SimpleTimestampSettings {
 	dateFormat: string;
 	createIfMissing: boolean;
 	excludedFolders: string[];
+	cooldownMinutes: number;
 }
 
 export const DEFAULT_SETTINGS: SimpleTimestampSettings = {
@@ -13,11 +14,37 @@ export const DEFAULT_SETTINGS: SimpleTimestampSettings = {
 	dateFormat: "YYYY/MM/DD HH:mm",
 	createIfMissing: false,
 	excludedFolders: [],
+	cooldownMinutes: 1,
 }
 
 // Object.prototype keys that would either poison frontmatter lookups or
 // trigger `in`-operator false positives if used as a property name.
 const FORBIDDEN_PROPERTY_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+	constructor(app: App, public inputEl: HTMLInputElement) {
+		super(app, inputEl);
+	}
+
+	getSuggestions(query: string): TFolder[] {
+		const lower = query.toLowerCase();
+		const matches: TFolder[] = [];
+		for (const f of this.app.vault.getAllLoadedFiles()) {
+			if (f instanceof TFolder && f.path.toLowerCase().includes(lower)) matches.push(f);
+		}
+		return matches;
+	}
+
+	renderSuggestion(folder: TFolder, el: HTMLElement): void {
+		el.setText(folder.path || "/");
+	}
+
+	selectSuggestion(folder: TFolder): void {
+		this.inputEl.value = folder.path;
+		this.inputEl.trigger("input");
+		this.close();
+	}
+}
 
 export class SimpleTimestampSettingTab extends PluginSettingTab {
 	plugin: SimpleTimestampPlugin;
@@ -31,8 +58,6 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 	display(): void {
 		const {containerEl} = this;
 		containerEl.empty();
-
-		new Setting(containerEl).setName("Simple Timestamp").setHeading();
 
 		new Setting(containerEl)
 			.setName("Property name")
@@ -79,17 +104,61 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Excluded folders")
-			.setDesc("Files in these folders (and their subfolders) will not be stamped. One path per line.")
-			.addTextArea((text) =>
-				text
-					.setPlaceholder("Templates\nDrafts")
-					.setValue(this.plugin.settings.excludedFolders.join("\n"))
-					.onChange(async (value) => {
-						this.plugin.settings.excludedFolders = value
-							.split("\n")
-							.map((s) => s.trim())
-							.filter((s) => s.length > 0);
+			.setDesc("Files in these folders (and their subfolders) will not be stamped.")
+			.setHeading();
+
+		const listContainer = containerEl.createDiv();
+		const renderExcludedList = () => {
+			listContainer.empty();
+			if (this.plugin.settings.excludedFolders.length === 0) {
+				listContainer.createDiv({
+					text: "No folders excluded.",
+					cls: "setting-item-description",
+				});
+				return;
+			}
+			this.plugin.settings.excludedFolders.forEach((path, idx) => {
+				new Setting(listContainer)
+					.setName(path)
+					.addExtraButton((btn) =>
+						btn
+							.setIcon("trash")
+							.setTooltip("Remove")
+							.onClick(async () => {
+								this.plugin.settings.excludedFolders.splice(idx, 1);
+								await this.plugin.saveSettings();
+								renderExcludedList();
+							})
+					);
+			});
+		};
+		renderExcludedList();
+
+		let addInput: HTMLInputElement;
+		new Setting(containerEl)
+			.setName("Add excluded folder")
+			.setDesc("Start typing to autocomplete an existing folder path.")
+			.addText((text) => {
+				addInput = text.inputEl;
+				new FolderSuggest(this.app, text.inputEl);
+				// eslint-disable-next-line obsidianmd/ui/sentence-case
+				text.setPlaceholder("path/to/folder");
+			})
+			.addButton((btn) =>
+				btn
+					.setButtonText("Add")
+					.setCta()
+					.onClick(async () => {
+						const value = addInput.value.trim();
+						if (!value) return;
+						if (this.plugin.settings.excludedFolders.includes(value)) {
+							new Notice("Already in list.");
+							return;
+						}
+						this.plugin.settings.excludedFolders.push(value);
 						await this.plugin.saveSettings();
+						addInput.value = "";
+						renderExcludedList();
 					})
 			);
 
@@ -115,7 +184,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 							const added = merged.length - before.size;
 							this.plugin.settings.excludedFolders = merged;
 							await this.plugin.saveSettings();
-							this.display();
+							renderExcludedList();
 							new Notice(
 								added === 0
 									? "All detected folders were already in the list."
@@ -124,6 +193,20 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 						} finally {
 							btn.setDisabled(false);
 						}
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Minimum minutes between stamps")
+			.setDesc("Skip stamping a file that was already stamped within this many minutes. 0 disables throttling.")
+			.addSlider((slider) =>
+				slider
+					.setLimits(0, 60, 1)
+					.setValue(this.plugin.settings.cooldownMinutes)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.cooldownMinutes = value;
+						await this.plugin.saveSettings();
 					})
 			);
 
@@ -158,6 +241,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 			);
 
 		dateFormatSetting.descEl.createEl("a", {
+			// eslint-disable-next-line obsidianmd/ui/sentence-case
 			text: "format reference",
 			href: "https://momentjs.com/docs/#/displaying/format/"
 		});
@@ -171,7 +255,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 		livePreviewEl.createEl("span", {text: "Preview: "});
 
 		const previewValue = livePreviewEl.createEl("span");
-		previewValue.style.color = "var(--color-accent)";
+		previewValue.addClass("simple-timestamp-preview-value");
 
 		return previewValue;
 	}

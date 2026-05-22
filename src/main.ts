@@ -14,6 +14,9 @@ export default class SimpleTimestampPlugin extends Plugin {
 	// mtime of our last write per path; lets us identify and skip self-triggered modify events.
 	private lastSelfMtime = new Map<string, number>();
 
+	// Wall-clock time of our last successful stamp per path; backs the cooldown setting.
+	private lastStampAt = new Map<string, number>();
+
 	async onload() {
 		await this.loadSettings();
 		this.addSettingTab(new SimpleTimestampSettingTab(this.app, this));
@@ -22,21 +25,25 @@ export default class SimpleTimestampPlugin extends Plugin {
 			this.app.vault.on("modify", (file) => {
 				if (!(file instanceof TFile) || file.extension !== "md") return;
 				if (file.stat.mtime === this.lastSelfMtime.get(file.path)) return;
-				this.stampFile(file);
+				void this.stampFile(file);
 			}),
 		);
 
-		// Keep lastSelfMtime in sync with file lifecycle so it doesn't leak entries.
+		// Keep per-path bookkeeping in sync with file lifecycle so it doesn't leak entries.
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
 				this.lastSelfMtime.delete(file.path);
+				this.lastStampAt.delete(file.path);
 			}),
 		);
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				const mt = this.lastSelfMtime.get(oldPath);
+				const stampedAt = this.lastStampAt.get(oldPath);
 				this.lastSelfMtime.delete(oldPath);
+				this.lastStampAt.delete(oldPath);
 				if (mt !== undefined) this.lastSelfMtime.set(file.path, mt);
+				if (stampedAt !== undefined) this.lastStampAt.set(file.path, stampedAt);
 			}),
 		);
 	}
@@ -52,6 +59,13 @@ export default class SimpleTimestampPlugin extends Plugin {
 		return false;
 	}
 
+	// Excalidraw drawings are stored as .md but their body is a JSON blob, not prose.
+	private isExcalidrawFile(file: TFile): boolean {
+		if (file.name.endsWith(".excalidraw.md")) return true;
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		return fm !== undefined && Object.prototype.hasOwnProperty.call(fm, "excalidraw-plugin");
+	}
+
 	// Single source of truth: stamp iff the property already exists, or the
 	// user has opted in to creating it. Used by both the cache fast-path and
 	// the in-callback re-check (which sees fresh disk state). hasOwnProperty
@@ -65,7 +79,15 @@ export default class SimpleTimestampPlugin extends Plugin {
 		if (this.inFlight.has(file.path)) return;
 		this.inFlight.add(file.path);
 		try {
+			if (file.stat.size === 0) return;
 			if (this.isInExcludedFolder(file)) return;
+			if (this.isExcalidrawFile(file)) return;
+
+			const cooldownMs = this.settings.cooldownMinutes * 60_000;
+			if (cooldownMs > 0) {
+				const last = this.lastStampAt.get(file.path);
+				if (last !== undefined && Date.now() - last < cooldownMs) return;
+			}
 
 			// Fast-path: metadata cache may lag behind the modify event (a freshly
 			// deleted property still appears present), so a positive result is
@@ -73,12 +95,16 @@ export default class SimpleTimestampPlugin extends Plugin {
 			if (!this.shouldStamp(this.app.metadataCache.getFileCache(file)?.frontmatter)) return;
 
 			const timestamp = moment().format(this.settings.dateFormat);
+			let didStamp = false;
 			await this.app.fileManager.processFrontMatter(file, (frontmatter: Record<string, unknown>) => {
 				if (!this.shouldStamp(frontmatter)) return;
 				frontmatter[this.settings.propertyName] = timestamp;
+				didStamp = true;
 			});
-			// Record the mtime our write produced so the resulting modify event can be identified.
+			// Always record the mtime: processFrontMatter writes even if our callback
+			// didn't mutate, and the resulting modify event must still be skipped.
 			this.lastSelfMtime.set(file.path, file.stat.mtime);
+			if (didStamp) this.lastStampAt.set(file.path, Date.now());
 		} catch (e) {
 			console.error("Simple Timestamp: failed to update frontmatter for", file.path, e);
 		} finally {
@@ -115,7 +141,8 @@ export default class SimpleTimestampPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const loaded = (await this.loadData()) as Partial<SimpleTimestampSettings> | null;
+		this.settings = {...DEFAULT_SETTINGS, ...loaded};
 	}
 
 	async saveSettings() {
