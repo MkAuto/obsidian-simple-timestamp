@@ -1,6 +1,6 @@
 {
-	"name": "obsidian-sample-plugin",
-	"version": "1.1.0",
+	"name": "obsidian-simple-timestamp",
+	"version": "1.0.0",
 	"description": "Automatically writes the current date/time to a property every time a note is created or saved.",
 	"main": "main.js",
 	"type": "module",
