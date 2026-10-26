@@ -1,15 +1,20 @@
-import {Plugin, TFile, moment, normalizePath} from "obsidian";
+import {Plugin, TFile, normalizePath} from "obsidian";
 import {
 	SimpleTimestampSettings,
 	SimpleTimestampSettingTab,
 	DEFAULT_SETTINGS,
 } from "./settings";
+import {formatNow} from "./time";
 
 export default class SimpleTimestampPlugin extends Plugin {
-	settings: SimpleTimestampSettings;
+	// Assigned by loadSettings() at the start of onload().
+	settings!: SimpleTimestampSettings;
 
 	// Paths currently being written; blocks concurrent stamps on the same file.
 	private inFlight = new Set<string>();
+
+	// Paths with an editor change that no modify event has consumed yet; only these get stamped.
+	private editedPaths = new Set<string>();
 
 	// mtime of our last write per path; lets us identify and skip self-triggered modify events.
 	private lastSelfMtime = new Map<string, number>();
@@ -22,9 +27,20 @@ export default class SimpleTimestampPlugin extends Plugin {
 		this.addSettingTab(new SimpleTimestampSettingTab(this.app, this));
 
 		this.registerEvent(
+			this.app.workspace.on("editor-change", (editor, info) => {
+				const file = info.file;
+				if (!file || this.editedPaths.has(file.path)) return;
+				void this.markIfEdited(file, editor.getValue());
+			}),
+		);
+
+		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
 				if (!(file instanceof TFile) || file.extension !== "md") return;
 				if (file.stat.mtime === this.lastSelfMtime.get(file.path)) return;
+				// Only writes carrying an editor change count. Sync, git, other plugins
+				// and link updates after a rename all modify files without one.
+				if (!this.editedPaths.delete(file.path)) return;
 				void this.stampFile(file);
 			}),
 		);
@@ -32,12 +48,14 @@ export default class SimpleTimestampPlugin extends Plugin {
 		// Keep per-path bookkeeping in sync with file lifecycle so it doesn't leak entries.
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				this.editedPaths.delete(file.path);
 				this.lastSelfMtime.delete(file.path);
 				this.lastStampAt.delete(file.path);
 			}),
 		);
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
+				if (this.editedPaths.delete(oldPath)) this.editedPaths.add(file.path);
 				const mt = this.lastSelfMtime.get(oldPath);
 				const stampedAt = this.lastStampAt.get(oldPath);
 				this.lastSelfMtime.delete(oldPath);
@@ -48,13 +66,20 @@ export default class SimpleTimestampPlugin extends Plugin {
 		);
 	}
 
+	// editor-change also fires when Obsidian reloads an open note after a disk
+	// write (sync, git, our own stamp). Only count it as an edit when the editor
+	// now differs from disk; the editor stores line breaks as \n.
+	private async markIfEdited(file: TFile, content: string) {
+		const disk = await this.app.vault.cachedRead(file);
+		if (content !== disk.replace(/\r\n/g, "\n")) this.editedPaths.add(file.path);
+	}
+
 	private isInExcludedFolder(file: TFile): boolean {
-		const filePath = file.path.toLowerCase();
 		for (const raw of this.settings.excludedFolders) {
-			const folder = normalizePath(raw).toLowerCase();
-			if (folder.length === 0 || folder === "/") continue;
-			if (filePath === folder) return true;
-			if (filePath.startsWith(folder + "/")) return true;
+			const folder = normalizePath(raw);
+			if (folder === "/") continue;
+			if (file.path === folder) return true;
+			if (file.path.startsWith(folder + "/")) return true;
 		}
 		return false;
 	}
@@ -92,9 +117,13 @@ export default class SimpleTimestampPlugin extends Plugin {
 			// Fast-path: metadata cache may lag behind the modify event (a freshly
 			// deleted property still appears present), so a positive result is
 			// re-verified against disk inside processFrontMatter.
-			if (!this.shouldStamp(this.app.metadataCache.getFileCache(file)?.frontmatter)) return;
+			const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+			if (!this.shouldStamp(cached)) return;
 
-			const timestamp = moment().format(this.settings.dateFormat);
+			const timestamp = formatNow(this.settings.dateFormat);
+			// Rewriting the same value would still touch the file and wake up sync.
+			if (cached?.[this.settings.propertyName] === timestamp) return;
+
 			let didStamp = false;
 			await this.app.fileManager.processFrontMatter(file, (frontmatter: Record<string, unknown>) => {
 				if (!this.shouldStamp(frontmatter)) return;
@@ -130,8 +159,9 @@ export default class SimpleTimestampPlugin extends Plugin {
 			try {
 				const parsed = JSON.parse(await adapter.read(path)) as Record<string, unknown>;
 				const value = parsed[key];
-				if (typeof value === "string" && value.length > 0) {
-					found.push(value.replace(/\/+$/, ""));
+				if (typeof value === "string") {
+					const folder = normalizePath(value);
+					if (folder !== "/") found.push(folder);
 				}
 			} catch {
 				// Malformed config file; skip silently.
@@ -142,7 +172,8 @@ export default class SimpleTimestampPlugin extends Plugin {
 
 	async loadSettings() {
 		const loaded = (await this.loadData()) as Partial<SimpleTimestampSettings> | null;
-		this.settings = {...DEFAULT_SETTINGS, ...loaded};
+		// Copy the default array so pushing to it doesn't mutate DEFAULT_SETTINGS.
+		this.settings = {...DEFAULT_SETTINGS, excludedFolders: [...DEFAULT_SETTINGS.excludedFolders], ...loaded};
 	}
 
 	async saveSettings() {

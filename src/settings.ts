@@ -1,5 +1,6 @@
-import {AbstractInputSuggest, App, Notice, PluginSettingTab, Setting, TFolder, moment} from "obsidian";
+import {AbstractInputSuggest, App, Notice, PluginSettingTab, Setting, TFolder, normalizePath} from "obsidian";
 import SimpleTimestampPlugin from "./main";
+import {formatNow} from "./time";
 
 export interface SimpleTimestampSettings {
 	propertyName: string;
@@ -11,7 +12,8 @@ export interface SimpleTimestampSettings {
 
 export const DEFAULT_SETTINGS: SimpleTimestampSettings = {
 	propertyName: "updated",
-	dateFormat: "YYYY/MM/DD HH:mm",
+	// Obsidian's "Date & time" property type (and Dataview) only read this ISO shape as a date.
+	dateFormat: "YYYY-MM-DDTHH:mm",
 	createIfMissing: false,
 	excludedFolders: [],
 	cooldownMinutes: 1,
@@ -22,32 +24,24 @@ export const DEFAULT_SETTINGS: SimpleTimestampSettings = {
 const FORBIDDEN_PROPERTY_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
 class FolderSuggest extends AbstractInputSuggest<TFolder> {
-	constructor(app: App, public inputEl: HTMLInputElement) {
-		super(app, inputEl);
-	}
-
 	getSuggestions(query: string): TFolder[] {
 		const lower = query.toLowerCase();
 		const matches: TFolder[] = [];
 		for (const f of this.app.vault.getAllLoadedFiles()) {
-			if (f instanceof TFolder && f.path.toLowerCase().includes(lower)) matches.push(f);
+			// The vault root can't be excluded, so don't offer it.
+			if (f instanceof TFolder && !f.isRoot() && f.path.toLowerCase().includes(lower)) matches.push(f);
 		}
 		return matches;
 	}
 
 	renderSuggestion(folder: TFolder, el: HTMLElement): void {
-		el.setText(folder.path || "/");
-	}
-
-	selectSuggestion(folder: TFolder): void {
-		this.inputEl.value = folder.path;
-		this.inputEl.trigger("input");
-		this.close();
+		el.setText(folder.path);
 	}
 }
 
 export class SimpleTimestampSettingTab extends PluginSettingTab {
 	plugin: SimpleTimestampPlugin;
+	private previewEl?: HTMLElement;
 	private previewInterval?: number;
 
 	constructor(app: App, plugin: SimpleTimestampPlugin) {
@@ -58,11 +52,12 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 	display(): void {
 		const {containerEl} = this;
 		containerEl.empty();
+		this.stopPreview();
 
 		new Setting(containerEl)
 			.setName("Property name")
 			.setDesc(
-				"The property that will be updated on every save."
+				"The property that will be updated whenever you edit a note."
 			)
 			.addText((text) =>
 				text
@@ -81,16 +76,12 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 			);
 
 		const dateFormatSetting = this.buildDateFormatSetting(containerEl);
-		const previewEl = this.buildDateFormatPreview(dateFormatSetting);
-
-		const renderPreview = () => {
-			previewEl.setText(moment().format(this.plugin.settings.dateFormat));
-		};
+		this.previewEl = this.buildDateFormatPreview(dateFormatSetting);
 
 		new Setting(containerEl)
 			.setName("Create property if missing")
 			.setDesc(
-				"When enabled, the property will be added to any Markdown file on save, " +
+				"When enabled, the property will be added to any Markdown file you edit, " +
 				"even if the property does not already exist."
 			)
 			.addToggle((toggle) =>
@@ -104,7 +95,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Excluded folders")
-			.setDesc("Files in these folders (and their subfolders) will not be stamped.")
+			.setDesc("Files in these folders (and their subfolders) will not be stamped. Paths are case-sensitive.")
 			.setHeading();
 
 		const listContainer = containerEl.createDiv();
@@ -117,7 +108,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 				});
 				return;
 			}
-			this.plugin.settings.excludedFolders.forEach((path, idx) => {
+			this.plugin.settings.excludedFolders.forEach((path) => {
 				new Setting(listContainer)
 					.setName(path)
 					.addExtraButton((btn) =>
@@ -125,7 +116,9 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 							.setIcon("trash")
 							.setTooltip("Remove")
 							.onClick(async () => {
-								this.plugin.settings.excludedFolders.splice(idx, 1);
+								// Remove by value: a fast double click must not hit the next entry.
+								this.plugin.settings.excludedFolders =
+									this.plugin.settings.excludedFolders.filter((p) => p !== path);
 								await this.plugin.saveSettings();
 								renderExcludedList();
 							})
@@ -135,31 +128,39 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 		renderExcludedList();
 
 		let addInput: HTMLInputElement;
+		const addFolder = async (raw: string) => {
+			const value = normalizePath(raw.trim());
+			if (value === "/") return;
+			if (this.plugin.settings.excludedFolders.includes(value)) {
+				new Notice("Already in list.");
+				return;
+			}
+			this.plugin.settings.excludedFolders.push(value);
+			await this.plugin.saveSettings();
+			addInput.value = "";
+			renderExcludedList();
+		};
 		new Setting(containerEl)
 			.setName("Add excluded folder")
-			.setDesc("Start typing to autocomplete an existing folder path.")
+			.setDesc("Pick a suggestion, or type a path and press enter.")
 			.addText((text) => {
 				addInput = text.inputEl;
-				new FolderSuggest(this.app, text.inputEl);
-				// eslint-disable-next-line obsidianmd/ui/sentence-case
-				text.setPlaceholder("path/to/folder");
+				const suggest = new FolderSuggest(this.app, text.inputEl);
+				suggest.onSelect((folder) => {
+					suggest.close();
+					void addFolder(folder.path);
+				});
+				// While suggestions are open, Obsidian's keymap consumes Enter and routes it to onSelect.
+				text.inputEl.addEventListener("keydown", (evt) => {
+					if (evt.key === "Enter" && !evt.isComposing) void addFolder(text.inputEl.value);
+				});
+				text.setPlaceholder("Folder/subfolder");
 			})
 			.addButton((btn) =>
 				btn
 					.setButtonText("Add")
 					.setCta()
-					.onClick(async () => {
-						const value = addInput.value.trim();
-						if (!value) return;
-						if (this.plugin.settings.excludedFolders.includes(value)) {
-							new Notice("Already in list.");
-							return;
-						}
-						this.plugin.settings.excludedFolders.push(value);
-						await this.plugin.saveSettings();
-						addInput.value = "";
-						renderExcludedList();
-					})
+					.onClick(() => addFolder(addInput.value))
 			);
 
 		new Setting(containerEl)
@@ -198,11 +199,12 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Minimum minutes between stamps")
-			.setDesc("Skip stamping a file that was already stamped within this many minutes. 0 disables throttling.")
+			.setDesc("Skip stamping a file that was already stamped within this many minutes. Set to 0 to disable throttling.")
 			.addSlider((slider) =>
 				slider
 					.setLimits(0, 60, 1)
 					.setValue(this.plugin.settings.cooldownMinutes)
+					// Deprecated in 1.13, which shows the value inline; older versions only show it through this tooltip.
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.cooldownMinutes = value;
@@ -211,12 +213,20 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 			);
 
 
-		renderPreview();
-		// Refresh preview every second; clear it when the tab is hidden
-		this.previewInterval = window.setInterval(renderPreview, 100);
+		this.renderPreview();
+		// Tick every second so formats with seconds stay live; editing the format re-renders at once.
+		this.previewInterval = window.setInterval(() => this.renderPreview(), 1000);
 	}
 
 	hide(): void {
+		this.stopPreview();
+	}
+
+	private renderPreview(): void {
+		this.previewEl?.setText(formatNow(this.plugin.settings.dateFormat));
+	}
+
+	private stopPreview(): void {
 		if (this.previewInterval !== undefined) {
 			window.clearInterval(this.previewInterval);
 			this.previewInterval = undefined;
@@ -227,7 +237,7 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 		const dateFormatSetting = new Setting(containerEl)
 			.setName("Date format")
 			.setDesc(
-				"For more syntax, refer to "
+				"Any Moment.js format string. "
 			)
 			.addText((text) =>
 				text
@@ -236,25 +246,25 @@ export class SimpleTimestampSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.dateFormat =
 							value.trim() || DEFAULT_SETTINGS.dateFormat;
+						this.renderPreview();
 						await this.plugin.saveSettings();
 					})
 			);
 
 		dateFormatSetting.descEl.createEl("a", {
-			// eslint-disable-next-line obsidianmd/ui/sentence-case
-			text: "format reference",
+			text: "Syntax reference",
 			href: "https://momentjs.com/docs/#/displaying/format/"
 		});
 		return dateFormatSetting;
 	}
 
 	private buildDateFormatPreview(dateFormatSetting: Setting): HTMLElement {
-		const livePreviewEl = dateFormatSetting.descEl.createEl("div", {
+		const livePreviewEl = dateFormatSetting.descEl.createDiv({
 			cls: "setting-item-description",
 		});
-		livePreviewEl.createEl("span", {text: "Preview: "});
+		livePreviewEl.createSpan({text: "Preview: "});
 
-		const previewValue = livePreviewEl.createEl("span");
+		const previewValue = livePreviewEl.createSpan();
 		previewValue.addClass("simple-timestamp-preview-value");
 
 		return previewValue;
